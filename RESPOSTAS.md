@@ -344,4 +344,141 @@ mensagens.
 
 ## Parte D — WebSocket
 
-_(a preencher)_
+### D1. O WebSocket começa com uma requisição HTTP contendo o cabeçalho `Upgrade: websocket`. O que exatamente "muda" na conexão depois que esse handshake é concluído?
+
+O que **não** muda é o mais importante para entender: a **conexão TCP é exatamente a mesma**.
+Ela não é fechada nem reaberta — não há um segundo *three-way handshake*. O que muda é o
+**protocolo falado por cima daquele socket**, que deixa de ser HTTP.
+
+O handshake funciona assim. O cliente abre uma conexão TCP comum e manda uma requisição HTTP
+normal, só que com cabeçalhos especiais:
+
+```http
+GET / HTTP/1.1
+Host: localhost:8887
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+```
+
+Se o servidor aceita, ele responde com o status **`101 Switching Protocols`** (e não o 200 de
+sempre), devolvendo em `Sec-WebSocket-Accept` um hash SHA-1 derivado da chave enviada — prova de
+que do outro lado há mesmo um servidor WebSocket, e não um servidor HTTP qualquer que ignorou os
+cabeçalhos. **Esse `101` é o instante da troca.**
+
+A partir dele, muda o seguinte:
+
+1. **Some o modelo requisição/resposta.** Em HTTP, quem fala é sempre o cliente: o servidor só
+   pode responder a um pedido. Depois do upgrade a conexão é **full-duplex e simétrica** —
+   qualquer um dos dois lados pode enviar a qualquer momento, sem ninguém ter pedido nada.
+2. **Muda o formato dos dados.** Em vez de cabeçalhos de texto, o fluxo passa a carregar
+   **frames** binários do WebSocket, com um cabeçalho curto (bit FIN, *opcode* indicando
+   texto/binário/close/ping/pong, bit de máscara e tamanho do payload). Como o cabeçalho tem
+   poucos bytes, some o overhead de reenviar cabeçalhos e cookies a cada mensagem.
+3. **Passa a existir fronteira de mensagem.** O frame diz onde cada mensagem começa e termina —
+   detalhe que volta a importar na pergunta D3.
+4. **Ganha-se manutenção de conexão embutida:** frames de *ping/pong* para detectar conexões
+   mortas e um *close handshake* com código de status para encerrar de forma limpa (é o que o
+   `socket.sendClose(WebSocket.NORMAL_CLOSURE, "Ate mais!")` do `MuralCliente` faz).
+
+Dá para **ver essa mudança acontecendo** na evidência `evidencias/websocket/`: assim que um
+cliente conecta, ele recebe `Bem-vindo(a) ao mural de avisos da turma!` **sem ter pedido nada**.
+Esse `conexao.send(...)` dentro do `onOpen` é exatamente o tipo de coisa que HTTP puro não
+permite — o servidor falando primeiro.
+
+Por fim, por que começar com HTTP em vez de já abrir um protocolo próprio? Para **atravessar a
+infraestrutura existente**: usando as portas 80/443 e um handshake que parece HTTP, a conexão
+passa por proxies, firewalls e balanceadores que rejeitariam uma porta exótica. É uma decisão
+pragmática de compatibilidade — o assunto da última parte da D3.
+
+### D2. Compare o mural via WebSocket (Parte D) com o aviso via Multicast (Parte C). Qual a diferença na forma como cada um descobre e alcança os destinatários?
+
+A diferença está em **onde mora a lista de destinatários**: na *aplicação* (WebSocket) ou na
+*rede* (multicast).
+
+| | **Mural WebSocket (D)** | **Aviso multicast (C)** |
+|---|---|---|
+| Quem conhece a audiência | O **servidor**: tem um objeto de conexão por cliente | **Ninguém** no remetente; os roteadores conhecem os inscritos |
+| Como o destinatário entra | Abre uma **conexão TCP** com o servidor (handshake) | Faz `joinGroup()` / `IP_ADD_MEMBERSHIP` (IGMP) — nem fala com o remetente |
+| Como a mensagem é entregue | O servidor **percorre a lista e envia uma cópia para cada** | **Um único** datagrama; a rede replica nas bifurcações |
+| Tráfego para N clientes | **N** cópias (cresce linearmente) | **1** cópia (constante) |
+| Garantias | Confiável e ordenado (é TCP) | Best-effort: pode perder, duplicar, desordenar |
+| Alcance real | Toda a internet (NAT, proxy, TLS) | Na prática só a rede local — TTL e bloqueio de ISPs |
+| Sabe quem saiu? | Sim, via `onClose` | Não — nunca fica sabendo |
+
+No código a diferença é literal. O servidor WebSocket **itera sobre um registro**:
+
+```java
+for (WebSocket cliente : getConnections()) {   // MuralServidor.java
+    cliente.send(avisoFormatado);
+}
+```
+```python
+websockets.broadcast(clientes_conectados, aviso_formatado)   # mural_servidor.py
+```
+
+Ou seja, o "broadcast" do mural é **unicast repetido na camada de aplicação**. Já o
+`ServidorMulticast` não tem lista nenhuma: faz `socket.send(pacote)` uma vez por aviso e pronto.
+
+Isso apareceu nas evidências. O servidor WebSocket **contou** os clientes
+(`Novo aluno conectado. Total: 1`, `Total: 2`) e registrou o endereço de cada um; o servidor
+multicast imprimiu exatamente os mesmos 5 `Enviado:` no teste com dois clientes e no teste
+cruzado — para ele, **é indiferente quem está ouvindo, ou se há alguém**.
+
+A consequência prática de projeto: o multicast é imbatível em eficiência para distribuir a mesma
+informação a muitos ouvintes numa rede controlada (TV/rádio IP, cotações de bolsa, descoberta de
+serviços numa LAN), mas não funciona pela internet e não garante entrega. O WebSocket gasta N
+vezes mais banda, porém entrega de forma confiável, atravessa qualquer rede, sabe exatamente
+quem está conectado — e, principalmente, permite **conversa nos dois sentidos**: no mural
+qualquer aluno publica e todos veem, enquanto no multicast a comunicação é de mão única, do
+professor para a turma.
+
+### D3. Por que o WebSocket é mais adequado do que TCP "cru" (como o da Parte A) para este cenário de mural em tempo real, mesmo os dois sendo, no fundo, conexões TCP contínuas?
+
+De fato os dois são a mesma coisa no nível do transporte — a diferença é tudo que o WebSocket já
+resolve e que, em TCP puro, teríamos que construir à mão. Quatro pontos, do mais concreto ao
+mais estrutural:
+
+**1) Fronteira de mensagem.** O TCP entrega um **fluxo de bytes**, sem separar mensagens. Na
+Parte A nós inventamos uma convenção para contornar isso: `println()` / `readLine()`, usando o
+`\n` como separador. Funciona, mas é frágil — se um aviso contiver uma quebra de linha, ele
+chega partido em dois; e não há como enviar dados binários (uma imagem no mural, por exemplo).
+O WebSocket resolve isso no protocolo: cada `send()` é **uma mensagem**, e o `onMessage` /
+`async for` recebe exatamente aquela mensagem, inteira, com tipo (texto ou binário) — inclusive
+remontando mensagens grandes que tenham sido fragmentadas em vários frames.
+
+**2) Recepção assíncrona — e este é o ponto decisivo para "tempo real".** Olhe o laço do
+`ClienteTCP` da Parte A:
+
+```java
+saida.println(linha);              // envia
+System.out.println(entrada.readLine());   // e fica BLOQUEADO esperando a resposta
+```
+
+Ele é estritamente alternado: fala, espera resposta, fala de novo. Enquanto está parado no
+`teclado.readLine()` esperando o usuário digitar, ele **não consegue receber nada** do servidor.
+Num mural isso é fatal: as mensagens dos outros alunos chegam a qualquer momento, sem relação
+com o que este usuário está fazendo. Com TCP puro a saída seria criar **uma thread só para
+leitura** e sincronizar as duas. A API de WebSocket já é orientada a eventos — o `onText` do
+`MuralCliente` e a *task* `escutar()` do `mural_cliente.py` rodam em paralelo com a leitura do
+teclado — e é justamente por isso que, no print da evidência, o cliente 2 exibe o aviso do
+cliente 1 **sem ter feito nada**.
+
+**3) Ciclo de vida e gestão de vários clientes.** O `ServidorTCP` da Parte A atende **um** cliente
+e morre (pergunta A3). A biblioteca de WebSocket entrega pronto o que faltava: `onOpen`,
+`onClose`, `onError`, a coleção `getConnections()` com todos os conectados, e *ping/pong*
+automático para detectar quem caiu sem avisar. Em TCP cru, isso é um pool de threads e uma
+estrutura de dados concorrente escritos por nós.
+
+**4) Alcance e compatibilidade com a web.** Um servidor TCP cru na porta 5000 tende a ser
+barrado por firewall/proxy corporativo — e, principalmente, **nenhum navegador consegue abrir um
+socket TCP arbitrário**. Como o WebSocket nasce de um handshake HTTP nas portas 80/443, ele
+atravessa essa infraestrutura, aceita TLS (`wss://`) e é suportado nativamente por qualquer
+navegador com `new WebSocket("ws://...")`. Para um mural que os alunos abririam no navegador, TCP
+cru simplesmente **não é uma opção**.
+
+Resumindo: WebSocket não substitui o TCP, ele **padroniza uma camada em cima do TCP** com
+enquadramento de mensagens, comunicação bidirecional orientada a eventos, controle de conexão e
+compatibilidade com a web. Usar TCP puro aqui significaria reimplementar, com menos qualidade,
+tudo isso — o mesmo tipo de trade-off que apareceu na pergunta B3.
