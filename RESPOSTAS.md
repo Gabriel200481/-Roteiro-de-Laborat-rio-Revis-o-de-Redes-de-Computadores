@@ -212,7 +212,135 @@ garantias valem a pena em cada fluxo.
 
 ## Parte C — Multicast
 
-_(a preencher)_
+### C1. Qual é a diferença fundamental entre enviar a mesma mensagem para 3 clientes usando unicast repetido 3 vezes e enviar uma única vez via multicast? Pense em termos de tráfego de rede.
+
+A diferença fundamental é **onde a mensagem é duplicada**.
+
+No **unicast repetido**, quem duplica é o **remetente**: ele monta 3 pacotes idênticos no
+conteúdo, cada um com um IP de destino diferente, e coloca os 3 na rede. Os 3 pacotes saem pelo
+mesmo enlace de saída do servidor, um atrás do outro. Se os três clientes estiverem no mesmo
+prédio, os 3 pacotes atravessam o mesmo caminho quase inteiro, carregando o mesmo conteúdo. O
+consumo de banda no enlace do servidor cresce **linearmente** com o número de destinatários: 3
+clientes = 3× a banda; 100 clientes = 100× a banda.
+
+No **multicast**, quem duplica é a **rede**. O servidor emite **um único pacote**, endereçado ao
+grupo `230.0.0.1` — não a ninguém em particular. Esse pacote caminha uma única vez por cada
+enlace, e só é replicado nos pontos em que o caminho até os destinatários se **bifurca**
+(roteadores e switches com IGMP snooping). Em nenhum enlace o mesmo conteúdo trafega duas vezes.
+A banda gasta pelo servidor é **constante**: 1 pacote, independentemente de haver 2, 50 ou 500
+ouvintes.
+
+Há uma segunda diferença, tão importante quanto a de tráfego: o **acoplamento**. No unicast, o
+remetente precisa **conhecer a lista de destinatários** — sem os endereços, não há para quem
+enviar. No multicast ele não sabe (nem precisa saber) quem está ouvindo: quem decide receber são
+os próprios clientes, ao entrarem no grupo com o `joinGroup()` / `IP_ADD_MEMBERSHIP`. O remetente
+é totalmente desacoplado da audiência.
+
+Isso fica bem visível comparando o código deste roteiro. O
+[ServidorMulticast.java](java/multicast/ServidorMulticast.java) não tem nenhuma lista de
+clientes — ele executa exatamente 5 `socket.send()`, e foi assim tanto no teste com 2 clientes
+quanto no teste cruzado. Já o servidor WebSocket da Parte D faz literalmente o unicast repetido,
+só que na camada de aplicação:
+
+```java
+for (WebSocket cliente : getConnections()) {   // MuralServidor.java
+    cliente.send(avisoFormatado);              // uma cópia por cliente conectado
+}
+```
+
+Ou seja: uma mensagem para 3 clientes vira 3 envios. É a diferença entre "avisar cada aluno no
+particular" e "falar no microfone da sala".
+
+### C2. O que é o TTL (time-to-live) configurado no socket multicast e por que ele é importante para controlar o alcance dos pacotes na rede?
+
+O **TTL** é um campo de 8 bits do cabeçalho **IP** presente em qualquer pacote, não só em
+multicast. Ele funciona como um contador de saltos: **cada roteador que encaminha o pacote
+decrementa o TTL em 1**, e quando chega a zero o pacote é **descartado** (e um ICMP Time
+Exceeded é devolvido). A finalidade original é servir de rede de segurança contra *loops* de
+roteamento — sem ele, um pacote preso num ciclo circularia para sempre, consumindo banda.
+
+No multicast, esse mesmo campo ganha um segundo uso, que é o que interessa aqui: ele vira o
+**controle de escopo (alcance) do grupo**. Como o TTL define quantos roteadores o pacote pode
+atravessar, ele define na prática **até onde o aviso se espalha**:
+
+| TTL | Até onde a mensagem chega |
+|---|---|
+| 0 | Não sai da própria máquina |
+| 1 | Só a sub-rede local — não passa por nenhum roteador (é o **padrão**) |
+| 2 | Atravessa até 2 roteadores (rede do prédio/campus) |
+| valores maiores | Alcance progressivamente mais amplo |
+
+No código deste roteiro os dois servidores usam valores diferentes, o que vale registrar:
+
+- [servidor_multicast.py](python/multicast/servidor_multicast.py) define explicitamente
+  `sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)` — alcance de até 2 roteadores;
+- [ServidorMulticast.java](java/multicast/ServidorMulticast.java) **não** configura TTL, então
+  usa o padrão **1**, ficando restrito à sub-rede local. Para igualar ao Python, bastaria um
+  `socket.setOption(StandardSocketOptions.IP_MULTICAST_TTL, 2)`.
+
+Nos meus testes essa diferença não afetou o resultado, porque servidor e clientes estavam na
+**mesma máquina** — nenhum roteador no caminho, nenhum decremento de TTL. Ela só apareceria num
+cenário com sub-redes diferentes.
+
+Por que isso é importante: sem limite de escopo, uma mensagem de grupo tenderia a se espalhar
+muito além do público pretendido, desperdiçando banda em redes que não têm nenhum interessado —
+e expondo o conteúdo a quem não deveria vê-lo. O TTL é um controle de raio **barato e grosseiro**
+("não passe de N saltos"), que na prática hoje costuma ser combinado com endereços de **escopo
+administrativo** (a faixa `239.0.0.0/8`, reservada para uso interno de organizações) e com
+filtros nos roteadores de borda. Vale notar que TTL baixo é também a razão nº 1 de "meu cliente
+não recebe nada" quando servidor e cliente estão em redes diferentes.
+
+### C3. Se um dos clientes ficar temporariamente offline e voltar depois, ele recebe os avisos que perdeu? Por quê?
+
+**Não recebe.** As mensagens perdidas estão perdidas para sempre.
+
+Testei exatamente esse cenário com três clientes Java: um permaneceu no ar o tempo todo
+(controle), e outro foi derrubado depois do aviso #2 e reinscrito no grupo alguns segundos
+depois. O resultado:
+
+```
+--- CLIENTE SEMPRE NO AR ---            --- CLIENTE ANTES DE CAIR ---
+Recebido: Aviso #1                      Recebido: Aviso #1
+Recebido: Aviso #2                      Recebido: Aviso #2
+Recebido: Aviso #3                      (derrubado aqui)
+Recebido: Aviso #4
+Recebido: Aviso #5                      --- MESMO CLIENTE APOS RECONECTAR ---
+                                        Recebido: Aviso #5
+```
+
+O cliente que caiu perdeu os avisos **#3 e #4** definitivamente: ao voltar, ele só passou a
+receber o que foi enviado **a partir** do instante da nova inscrição.
+
+A razão está na arquitetura da comunicação em grupo usada aqui. O multicast IP é
+**best-effort** e roda sobre **UDP**, herdando todas as (não) garantias da Parte B:
+
+- **Ninguém guarda histórico.** O servidor faz `send()` e esquece; não há buffer de mensagens
+  antigas em lugar nenhum — nem no remetente, nem nos roteadores, nem nos clientes.
+- **O remetente não sabe quem são os membros**, que é justamente a vantagem do C1. Como não
+  existe lista de destinatários, não existe a noção de "fulano não recebeu" — e sem essa noção,
+  não há como haver retransmissão dirigida. O servidor sequer percebeu que um cliente sumiu.
+- **A entrega é decidida no instante do envio.** Um datagrama é encaminhado apenas para quem
+  estava inscrito no grupo naquele momento. Entrar no grupo (`joinGroup()` / IGMP) é um pedido
+  de "quero receber **daqui em diante**", nunca um pedido de sincronização.
+- **Não há sequer detecção de perda.** Como não há numeração nem ACK, o cliente que voltou não
+  tem como saber que existiram um aviso #3 e um #4 — no nosso caso isso só é perceptível porque
+  nós, humanos, vemos o número na mensagem.
+
+A analogia que funciona bem é a do **rádio**: quem não estava com o aparelho ligado na hora,
+perdeu; ligar depois não faz a emissora repetir. É o oposto do modelo de **caixa postal**.
+
+Se a aplicação precisasse dessa garantia, seria preciso construí-la por cima, porque o protocolo
+não dá — por exemplo, numerando as mensagens e fazendo o cliente pedir as que faltam (NACK), ou
+abandonando o multicast puro e usando um **broker com persistência** (MQTT com mensagens
+retidas, Kafka, RabbitMQ), que armazena o histórico e reentrega na reconexão. É o que o slide da
+aula quer dizer com "pode ser confiável ou não confiável, ordenado ou não ordenado": esses são
+**níveis de garantia construídos sobre** o multicast básico, não características que ele já tenha.
+
+Vale contrastar com a Parte D: no mural WebSocket o servidor **conhece** cada cliente conectado
+(`getConnections()` / o `set` `clientes_conectados`), então ele *teria* como reenviar algo a
+quem voltou — mas, do jeito que está implementado, também não guarda histórico. Saber quem são
+os destinatários é condição necessária, porém não suficiente: alguém precisa **guardar** as
+mensagens.
 
 ## Parte D — WebSocket
 
