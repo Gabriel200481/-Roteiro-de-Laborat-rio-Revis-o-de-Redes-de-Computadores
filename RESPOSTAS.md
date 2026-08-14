@@ -103,7 +103,112 @@ um cliente deixa de derrubar o servidor e os demais.
 
 ## Parte B — UDP
 
-_(a preencher)_
+### B1. O que aconteceu quando você enviou uma mensagem com o servidor desligado? Compare com o que aconteceria em TCP.
+
+O ponto mais importante do experimento é o que **não** aconteceu: **o envio não deu erro
+nenhum**. Tanto `socket.send(pacote)` (Java) quanto `cliente.sendto(...)` (Python) retornaram
+normalmente, como se tudo estivesse certo. O cliente entregou o datagrama à pilha de rede e
+seguiu em frente — ele **não tem como saber** que não havia ninguém escutando na porta 5001.
+
+O problema só apareceu no passo seguinte, na hora de *esperar a resposta*, e aí os dois
+programas se comportaram de forma diferente (ambos registrados em `evidencias/udp/`):
+
+| | Comportamento observado ao receber |
+|---|---|
+| **Java** (`ClienteUDP`) | Ficou **travado indefinidamente** em `socket.receive(resposta)`. Nenhuma exceção, nenhuma mensagem: o terminal simplesmente parou. Tive que abortar com `Ctrl+C`. |
+| **Python** (`cliente_udp.py`) | Morreu em `cliente.recvfrom(1024)` com `ConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host`. |
+
+A diferença **não** é do protocolo UDP, é de como cada plataforma trata um detalhe do sistema
+operacional. Quando um datagrama chega a uma porta sem ninguém escutando, a pilha de rede da
+máquina de destino costuma devolver um **ICMP Port Unreachable**. No Windows, esse ICMP é
+reportado ao socket UDP como um erro na próxima leitura — e é isso que o Python repassa como
+`ConnectionResetError`. O Java, por outro lado, só promete lançar `PortUnreachableException`
+quando o `DatagramSocket` está **conectado** (isto é, quando se chamou `connect()`); como o
+nosso socket é não conectado, ele ignora esse ICMP e continua bloqueado no `receive()`.
+
+Vale insistir num ponto: esse ICMP é uma **cortesia da pilha local**, não uma garantia do UDP.
+Como o teste foi em `localhost`, o aviso voltou imediatamente. Se o servidor estivesse em outra
+máquina, com um firewall descartando ICMP no caminho (o caso comum na internet), **nenhum dos
+dois** receberia aviso algum — os dois ficariam travados esperando para sempre. Ou seja: o
+comportamento "correto" e esperado do UDP é o do Java.
+
+**Comparando com o TCP (Parte A):** em TCP a falha aparece **antes**, no `connect()`, com um
+erro claro e imediato (`Connection refused` / `WinError 10061`), porque o *three-way handshake*
+precisa de alguém do outro lado para responder — o próprio protocolo verifica a existência do
+destinatário antes de qualquer dado trafegar. Em UDP não existe handshake nem estado de
+conexão: `sendto()` é essencialmente "joga esse pacote na rede e esquece". Isso é exatamente o
+que significa **"sem conexão"** — não há nada, nem no protocolo nem no socket, que represente
+"estou falando com fulano". O UDP nem sequer sabe distinguir "a mensagem chegou e a resposta se
+perdeu" de "não havia servidor algum": nos dois casos o cliente apenas fica esperando. Se a
+aplicação quiser detectar isso, ela mesma precisa implementar **timeout** (por exemplo,
+`socket.setSoTimeout(3000)` em Java ou `cliente.settimeout(3)` em Python) e uma política de
+retentativa — que é, no fundo, começar a reconstruir na mão o que o TCP já entrega pronto.
+
+### B2. Cite dois exemplos de aplicações reais que usam UDP e explique por que a confiabilidade do TCP não é essencial (ou até atrapalharia).
+
+**1) DNS (resolução de nomes).** Uma consulta DNS típica é minúscula: um pacote de pergunta
+("qual o IP de `puc.br`?") e um de resposta. Usar TCP obrigaria a gastar um *round-trip* inteiro
+só no handshake **antes** de mandar a pergunta, mais outro para encerrar a conexão — ou seja, a
+consulta ficaria ~3x mais lenta por causa de burocracia de conexão, para transferir algumas
+dezenas de bytes. Como a troca cabe em um pacote, a confiabilidade sai muito mais barata na
+aplicação: se a resposta não chega em alguns milissegundos, o *resolver* simplesmente repete a
+pergunta (eventualmente para outro servidor). É o mesmo raciocínio que vale para **DHCP** e
+**NTP**: transações curtas, sem estado, em que reenviar é mais barato que manter conexão.
+
+**2) Voz e vídeo em tempo real (VoIP, chamadas de WhatsApp/Meet, transmissão ao vivo).** Aqui a
+confiabilidade do TCP **atrapalha de verdade**, e não é só questão de overhead. O áudio tem um
+prazo de validade: o pacote referente ao milissegundo 300 da conversa só serve se chegar a tempo
+de ser reproduzido no milissegundo 300. Se ele se perder, retransmitir é inútil — quando a
+retransmissão chegar, aquele trecho já passou. Pior: o TCP entrega **em ordem**, então, enquanto
+ele reenvia o pacote perdido, todos os pacotes seguintes — que já chegaram e estão prontos —
+ficam retidos no buffer esperando a lacuna ser preenchida (o chamado *head-of-line blocking*).
+O resultado prático é a chamada "congelar" e depois acelerar, acumulando atraso que nunca mais
+é recuperado. Com UDP, o pacote perdido vira no máximo um micro-chiado de alguns milissegundos e
+a conversa continua fluindo — trocar um pouco de qualidade por latência baixa é exatamente o
+negócio certo aqui.
+
+Pelo mesmo motivo entram nessa lista os **jogos online** (a posição de um jogador é atualizada
+dezenas de vezes por segundo; o pacote seguinte já torna o perdido irrelevante) e o próprio
+**multicast** da Parte C, que só existe sobre UDP.
+
+### B3. O servidor UDP não mantém nenhum registro de "quem está conectado". Isso seria possível de implementar? O que mudaria na arquitetura?
+
+**Sim, é possível — mas o trabalho todo passa a ser da aplicação, não do protocolo.** E, na
+verdade, metade do caminho já está no código: o servidor **já sabe** quem mandou cada datagrama.
+Em Java, `pacoteRecebido.getAddress()` e `.getPort()`; em Python, o `endereco_cliente` devolvido
+por `recvfrom()`. É justamente esse par `(IP, porta)` que usamos para responder. O que falta não
+é a identidade — é **guardá-la entre um datagrama e outro**.
+
+A implementação mínima seria manter uma coleção no servidor, por exemplo um
+`Map<String, Instant>` (Java) ou um `dict` (Python) indexado por `(ip, porta)`, registrando cada
+remetente e a hora do último datagrama recebido. O que muda na arquitetura:
+
+- **O servidor deixa de ser sem estado.** Hoje cada `receive()` é independente e o servidor
+  poderia ser reiniciado entre dois datagramas sem ninguém perceber. Com registro de clientes,
+  passa a existir memória que cresce com o número de clientes e que se perde no reinício.
+- **Não existe evento de "saiu".** Em TCP, fechar o socket gera FIN e o servidor detecta o fim
+  (no nosso `ServidorTCP`, o `readLine()` devolve `null`). Em UDP não há nada disso: um cliente
+  que fecha o programa, cai a rede ou desliga o computador é indistinguível de um cliente
+  calado. A única saída é **inferir** a saída por inatividade: definir um *timeout* (ex.: 30 s
+  sem datagramas = removido) e exigir **heartbeats/keep-alive** periódicos dos clientes, mais
+  uma rotina de limpeza rodando em paralelo com o laço principal.
+- **Passa a ser preciso um protocolo de aplicação.** Mensagens deixam de ser texto solto e
+  ganham tipo: `REGISTRAR`, `SAIR`, `PING`, `MENSAGEM`. Isso é o embrião de um protocolo próprio.
+- **Duplicação e reordenação viram problema seu.** Como o UDP não numera nada, dois datagramas
+  iguais podem chegar (retransmissão do cliente) ou fora de ordem; se a aplicação for sensível a
+  isso, ela precisa de seus próprios números de sequência.
+- **Segurança fica mais frágil.** Sem handshake, o endereço de origem de um datagrama é fácil de
+  forjar (*IP spoofing*): qualquer um pode se registrar fingindo ser outro, ou inflar a tabela de
+  clientes com endereços falsos. O handshake do TCP dá, de graça, uma prova mínima de que o
+  remetente realmente recebe no endereço que alega.
+
+Repare no padrão: registro de participantes, detecção de saída, ordenação, deduplicação — item
+por item, estaríamos reimplementando na aplicação aquilo que o TCP já oferece pronto. Isso só se
+justifica quando se precisa de algo que o TCP não dá (latência baixa, envio em grupo, controle
+fino sobre o que retransmitir); caso contrário, o caminho mais sensato é usar TCP. Um meio-termo
+comum no mundo real é o **QUIC** (base do HTTP/3), que roda sobre UDP e reimplementa conexão,
+ordenação e confiabilidade no espaço da aplicação — justamente para poder escolher quais dessas
+garantias valem a pena em cada fluxo.
 
 ## Parte C — Multicast
 
